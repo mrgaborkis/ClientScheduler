@@ -1,0 +1,367 @@
+Sub SyncClientSchedules_Click()
+    Dim OutApp As Outlook.Application
+    Dim sh As Worksheet: Set sh = ActiveSheet
+    Dim holSh As Worksheet
+    Dim i As Long, evBase As Integer
+    Dim alertParts As Variant, part As Variant
+    Dim remDate As Date, daysOut As Integer
+    Dim cleanPart As String, dStr As String
+
+    ' --- SYNC IDENTITY ---
+    Dim syncCategory As String: syncCategory = "ExcelClientScheduleSync"
+    Dim syncStamp As String:    syncStamp = "SYNC_ID:ExcelClientScheduleSync"
+
+    Dim holidayRange As Range
+    Dim todayDate As Date: todayDate = Date
+
+    ' --- PERFORMANCE & HANG PREVENTION ---
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.StatusBar = "Starting Sync... Accessing Outlook."
+
+    ' Ensure Outlook is accessible
+    On Error Resume Next
+    Set OutApp = GetObject(, "Outlook.Application")
+    If OutApp Is Nothing Then Set OutApp = CreateObject("Outlook.Application")
+    On Error GoTo 0
+
+    If OutApp Is Nothing Then
+        MsgBox "Outlook could not be started. Please open Outlook and try again.", vbCritical
+        GoTo CleanupAndExit
+    End If
+
+    ' Identify the Holiday range on the "Holidays" sheet
+    On Error Resume Next
+    Set holSh = Sheets("Holidays")
+    On Error GoTo 0
+    If Not holSh Is Nothing Then
+        Set holidayRange = holSh.Range("A2:A" & holSh.Cells(Rows.Count, 1).End(xlUp).Row)
+    End If
+
+    ' =========================================================
+    ' --- 1. CLEANUP ---
+    ' =========================================================
+
+    Dim OutFolder As Outlook.MAPIFolder
+    Dim OutItems As Outlook.Items
+    Dim FilteredItems As Outlook.Items
+    Dim oItem As Object
+    Dim deleteList() As Outlook.AppointmentItem
+    Dim deleteCount As Long
+    Dim confirmedCount As Long
+
+    Set OutFolder = OutApp.GetNamespace("MAPI").GetDefaultFolder(olFolderCalendar)
+    Set OutItems = OutFolder.Items
+
+    Dim filterStr As String
+    filterStr = "@SQL=" & Chr(34) & "urn:schemas-microsoft-com:office:office#Keywords" & Chr(34) & _
+                " LIKE '%" & syncCategory & "%'"
+
+    Set FilteredItems = OutItems.Restrict(filterStr)
+
+    confirmedCount = 0
+    If FilteredItems.Count > 0 Then
+        ReDim deleteList(0 To FilteredItems.Count - 1)
+    End If
+
+    Application.StatusBar = "Scanning " & FilteredItems.Count & " category-matched entries for stamp verification..."
+    DoEvents
+
+    For Each oItem In FilteredItems
+        On Error Resume Next
+        If TypeOf oItem Is Outlook.AppointmentItem Then
+            If InStr(1, oItem.Body, syncStamp, vbTextCompare) > 0 Then
+                Set deleteList(confirmedCount) = oItem
+                confirmedCount = confirmedCount + 1
+            End If
+        End If
+        On Error GoTo 0
+    Next oItem
+
+    Application.StatusBar = confirmedCount & " entries confirmed for deletion..."
+    DoEvents
+
+    deleteCount = 0
+    Dim j As Long
+    For j = 0 To confirmedCount - 1
+        On Error Resume Next
+        deleteList(j).Delete
+        deleteCount = deleteCount + 1
+        On Error GoTo 0
+        If deleteCount Mod 10 = 0 Then
+            Application.StatusBar = "Deleting: " & deleteCount & " of " & confirmedCount & "..."
+            DoEvents
+        End If
+    Next j
+
+    ' Purge from Deleted Items so removal is permanent whether Outlook is open or closed
+    Application.StatusBar = "Purging deleted entries from Deleted Items folder..."
+    DoEvents
+
+    Dim DelFolder As Outlook.MAPIFolder
+    Dim DelItems As Outlook.Items
+    Dim DelFiltered As Outlook.Items
+    Dim delPurgeList() As Outlook.AppointmentItem
+    Dim delConfirmed As Long
+
+    Set DelFolder = OutApp.GetNamespace("MAPI").GetDefaultFolder(olFolderDeletedItems)
+    Set DelItems = DelFolder.Items
+    Set DelFiltered = DelItems.Restrict(filterStr)
+
+    delConfirmed = 0
+    If DelFiltered.Count > 0 Then
+        ReDim delPurgeList(0 To DelFiltered.Count - 1)
+        For Each oItem In DelFiltered
+            On Error Resume Next
+            If TypeOf oItem Is Outlook.AppointmentItem Then
+                If InStr(1, oItem.Body, syncStamp, vbTextCompare) > 0 Then
+                    Set delPurgeList(delConfirmed) = oItem
+                    delConfirmed = delConfirmed + 1
+                End If
+            End If
+            On Error GoTo 0
+        Next oItem
+
+        For j = 0 To delConfirmed - 1
+            On Error Resume Next
+            delPurgeList(j).Delete
+            On Error GoTo 0
+        Next j
+    End If
+
+    Application.StatusBar = "Cleanup complete. " & deleteCount & " entries removed. Starting sync..."
+    DoEvents
+
+    ' =========================================================
+    ' --- 2. SYNC: PROCESS ROWS (starts at row 5) ---
+    ' =========================================================
+
+    Dim lastRow As Long: lastRow = sh.Cells(Rows.Count, 2).End(xlUp).Row
+
+    Dim deadlineCount As Long: deadlineCount = 0
+    Dim alertTally As Object
+    Set alertTally = CreateObject("Scripting.Dictionary")
+
+    For i = 5 To lastRow
+        Application.StatusBar = "Syncing Row " & i & " of " & lastRow & " (" & sh.Cells(i, 2).Value & ")"
+
+        If LCase(Trim(sh.Cells(i, 1).Value)) = "yes" Then
+
+            For evBase = 7 To 17 Step 5
+
+                If LCase(Trim(sh.Cells(i, evBase).Value)) = "yes" Then
+
+                    Dim evType As String:    evType = Trim(sh.Cells(i, evBase + 1).Value)
+                    Dim evDesc As String:    evDesc = Trim(sh.Cells(i, evBase + 2).Value)
+                    Dim alertStr As String:  alertStr = sh.Cells(i, evBase + 3).Value
+                    Dim deadline As Variant: deadline = sh.Cells(i, evBase + 4).Value
+
+                    If IsDate(deadline) Then
+
+                        ' A: MANDATORY DEADLINE EVENT
+                        If Not holidayRange Is Nothing Then
+                            remDate = Application.WorksheetFunction.WorkDay(CDate(deadline) + 1, -1, holidayRange)
+                        Else
+                            remDate = Application.WorksheetFunction.WorkDay(CDate(deadline) + 1, -1)
+                        End If
+
+                        If remDate >= todayDate Then
+                            Call CreateOutlookEvent(OutApp, remDate, evType, sh.Cells(i, 2).Value, 0, _
+                                                    sh.Cells(i, 4).Value, sh.Cells(i, 6).Value, _
+                                                    sh.Cells(i, 5).Value, evDesc, deadline, _
+                                                    sh.Cells(i, 3).Value, syncCategory, syncStamp)
+                            deadlineCount = deadlineCount + 1
+                        End If
+
+                        ' B: ADVANCE ALERTS
+                        alertParts = Split(alertStr, "|")
+                        For Each part In alertParts
+                            cleanPart = Trim(CStr(part))
+
+                            If LCase(Right(cleanPart, 2)) = ":y" Then
+                                Dim dPos As Integer
+                                dPos = InStr(LCase(cleanPart), "d:")
+                                If dPos > 1 Then
+                                    dStr = Trim(Left(cleanPart, dPos - 1))
+                                    If IsNumeric(dStr) Then
+                                        daysOut = CInt(dStr)
+                                        If daysOut > 0 Then
+                                            If Not holidayRange Is Nothing Then
+                                                remDate = Application.WorksheetFunction.WorkDay(CDate(deadline) - daysOut + 1, -1, holidayRange)
+                                            Else
+                                                remDate = Application.WorksheetFunction.WorkDay(CDate(deadline) - daysOut + 1, -1)
+                                            End If
+
+                                            If remDate >= todayDate Then
+                                                Call CreateOutlookEvent(OutApp, remDate, evType, sh.Cells(i, 2).Value, daysOut, _
+                                                                        sh.Cells(i, 4).Value, sh.Cells(i, 6).Value, _
+                                                                        sh.Cells(i, 5).Value, evDesc, deadline, _
+                                                                        sh.Cells(i, 3).Value, syncCategory, syncStamp)
+                                                Dim dayKey As String: dayKey = CStr(daysOut)
+                                                If alertTally.Exists(dayKey) Then
+                                                    alertTally(dayKey) = alertTally(dayKey) + 1
+                                                Else
+                                                    alertTally.Add dayKey, 1
+                                                End If
+                                            End If
+                                        End If
+                                    End If
+                                End If
+                            End If
+                        Next part
+
+                    End If
+                End If
+            Next evBase
+        End If
+
+        DoEvents
+    Next i
+
+    ' =========================================================
+    ' --- 3. BUILD SUMMARY MESSAGE ---
+    ' =========================================================
+
+    Dim totalCreated As Long: totalCreated = deadlineCount
+    Dim summaryLines As String
+    summaryLines = "  Deadlines :  " & deadlineCount
+
+    Dim alertKeys() As String
+    Dim alertVals() As Long
+    Dim keyCount As Integer: keyCount = alertTally.Count
+
+    If keyCount > 0 Then
+        ReDim alertKeys(0 To keyCount - 1)
+        ReDim alertVals(0 To keyCount - 1)
+
+        Dim k As Integer: k = 0
+        Dim kk As Variant
+        For Each kk In alertTally.Keys
+            alertKeys(k) = CStr(kk)
+            alertVals(k) = alertTally(kk)
+            totalCreated = totalCreated + alertTally(kk)
+            k = k + 1
+        Next kk
+
+        Dim swapped As Boolean
+        Dim tmpKey As String, tmpVal As Long
+        Do
+            swapped = False
+            For k = 0 To keyCount - 2
+                If CLng(alertKeys(k)) < CLng(alertKeys(k + 1)) Then
+                    tmpKey = alertKeys(k):   alertKeys(k) = alertKeys(k + 1):   alertKeys(k + 1) = tmpKey
+                    tmpVal = alertVals(k):   alertVals(k) = alertVals(k + 1):   alertVals(k + 1) = tmpVal
+                    swapped = True
+                End If
+            Next k
+        Loop While swapped
+
+        For k = 0 To keyCount - 1
+            summaryLines = summaryLines & vbCrLf & _
+                           "  -" & alertKeys(k) & "d Alerts:  " & alertVals(k)
+        Next k
+    End If
+
+    ' =========================================================
+    ' --- 4. TIMESTAMP & SAVE ---
+    ' =========================================================
+    sh.Range("D2").Value = "Last Synced: " & Now
+    ThisWorkbook.Save
+
+    MsgBox "Sync Complete!" & vbCrLf & vbCrLf & _
+           "  Removed:  " & deleteCount & " old calendar entries" & vbCrLf & _
+           "  Created:  " & totalCreated & " new calendar entries" & vbCrLf & vbCrLf & _
+           "  Breakdown:" & vbCrLf & summaryLines, vbInformation
+
+CleanupAndExit:
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    Application.StatusBar = False
+End Sub
+
+
+' =============================================================
+' HELPER: Creates a single Outlook calendar appointment.
+'
+' BODY FORMAT — each field on its own line for readability.
+' Phone is written as tel: URI so mobile Outlook renders it
+' as a tappable dial link:
+'   tel:+18136019216
+' Digits are stripped from whatever format is in the sheet
+' (e.g. "(813) 601-9216") and prefixed with the country code.
+' =============================================================
+Private Function StripToDigits(s As String) As String
+    Dim result As String
+    Dim c As String
+    Dim idx As Integer
+    result = ""
+    For idx = 1 To Len(s)
+        c = Mid(s, idx, 1)
+        If c >= "0" And c <= "9" Then result = result & c
+    Next idx
+    StripToDigits = result
+End Function
+
+Private Sub CreateOutlookEvent(olApp As Outlook.Application, _
+                               rDate As Date, _
+                               eType As String, _
+                               cName As String, _
+                               dPrior As Integer, _
+                               aEmail As String, _
+                               cPhone As String, _
+                               cEmail As String, _
+                               eDesc As String, _
+                               dLine As Variant, _
+                               eeCount As Variant, _
+                               cat As String, _
+                               stamp As String)
+
+    ' Build a clean tel: URI from whatever phone format is in the sheet.
+    ' Strip all non-digits, assume US number (10 digits), prepend +1.
+    Dim rawDigits As String: rawDigits = StripToDigits(cPhone)
+    Dim telLink As String
+    If Len(rawDigits) = 10 Then
+        telLink = "tel:+1" & rawDigits          ' US 10-digit: (813) 601-9216 -> tel:+18136019216
+    ElseIf Len(rawDigits) = 11 And Left(rawDigits, 1) = "1" Then
+        telLink = "tel:+" & rawDigits            ' already has country code: 18136019216 -> tel:+18136019216
+    Else
+        telLink = "tel:" & rawDigits             ' international / unknown — just strip formatting
+    End If
+
+    Dim Appt As Outlook.AppointmentItem
+    Set Appt = olApp.CreateItem(olAppointmentItem)
+
+    With Appt
+        If dPrior = 0 Then
+            .Subject = "DEADLINE: " & eType & " | " & cName
+        Else
+            .Subject = "-" & dPrior & "d Alert: " & eType & " | " & cName
+        End If
+
+        .Start = rDate + TimeValue("08:00:00")
+        .AllDayEvent = True
+        .Categories = cat & ", Orange Category"
+        .RequiredAttendees = aEmail
+
+        ' Body: each field on its own line, phone as tappable tel: link
+        .Body = "Client: " & cName & vbCrLf & _
+                "-------------------------" & vbCrLf & _
+                "Event: " & eType & vbCrLf & _
+                "Description: " & eDesc & vbCrLf & _
+                "Official Deadline: " & Format(CDate(dLine), "mmmm d, yyyy") & vbCrLf & _
+                "-------------------------" & vbCrLf & _
+                "Agent Email: " & aEmail & vbCrLf & _
+                "Contact Email: " & cEmail & vbCrLf & _
+                "Contact Phone: " & telLink & vbCrLf & _
+                "Employee Count: " & eeCount & vbCrLf & _
+                "-------------------------" & vbCrLf & _
+                stamp
+
+        .ReminderSet = True
+        .Save
+    End With
+
+    Set Appt = Nothing
+End Sub
+
+
